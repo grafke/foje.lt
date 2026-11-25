@@ -5,10 +5,11 @@ import re
 def sql_string(raw):
     escapes = {'n': '\n', 'r': '\r', 't': '\t', '0': '', 'Z': ''}
     text = re.sub(r"\\(.)|''", lambda m: escapes.get(m[1], m[1]) if m[1] else "'", raw, flags=re.S)
-    # The PHP app saved text with magic_quotes on, so stored values carry a second layer of escaping.
+    # With magic_quotes on, the PHP app stored text with one or two extra addslashes layers. addslashes
+    # never doubles quotes, so a stored '' is what the visitor typed.
     previous = None
     while previous != text:
-        previous, text = text, re.sub(r"\\([\"'\\])|''", lambda m: m[1] or "'", text)
+        previous, text = text, re.sub(r"\\([\"'\\])", r"\1", text)
     return text
 
 
@@ -32,15 +33,17 @@ def read_row(text, i):
             return None, i
 
 
-def parse_dump(path):
+def parse_dump(path, wanted):
     text = path.read_bytes().decode('cp1257', errors='replace')
-    tables = {}
+    tables, skipped = {}, {}
     for insert in re.finditer(r'INSERT INTO `(\w+)` \(([^)]*)\) VALUES ', text):
+        if insert[1] not in wanted:
+            continue
         columns = re.findall(r'`(\w+)`', insert[2])
         end = text.find('CREATE TABLE', insert.end())
         region = text[insert.end():end if end > 0 else len(text)]
-        rows, last = [], 0
-        # The 2011 spam cleanup blanked lines inside multi-line rows; such broken rows fail to parse and are skipped.
+        rows, last, broken = [], 0, 0
+        # The 2011 spam cleanup blanked lines inside multi-line rows; such broken rows fail to parse.
         for start in re.finditer(r'^\(', region, re.M):
             if start.start() < last:
                 continue
@@ -48,8 +51,10 @@ def parse_dump(path):
             if values is not None and len(values) == len(columns):
                 rows.append(dict(zip(columns, values)))
                 last = stop
-        tables[insert[1]] = rows
-    return tables
+            else:
+                broken += 1
+        tables[insert[1]], skipped[insert[1]] = rows, broken
+    return tables, skipped
 
 
 class Template:
@@ -59,7 +64,10 @@ class Template:
 
     def block(self, handle, name):
         pattern = re.compile(r'<!--\s+BEGIN %s\s+-->(.*)\n\s*<!--\s+END %s\s+-->' % (handle, handle), re.S)
-        self.vars[handle] = pattern.search(self.text)[1]
+        match = pattern.search(self.text)
+        if not match:
+            raise ValueError(f'template has no block {handle}')
+        self.vars[handle] = match[1]
         self.text = pattern.sub(lambda _: '{%s}' % name, self.text)
         self.vars[name] = ''
 

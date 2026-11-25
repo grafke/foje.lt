@@ -15,8 +15,10 @@ DUMP = 'foje1.sql'
 SPAM_FORUM_POSTS = {5305, 5328, 5350, 8167, 8211}
 SPAM_MARKERS = re.compile(r'https?://|www\.|\[url|\[a\]|<a |</a>|\.com|\.info|\.biz|Content-Type:', re.I)
 LITHUANIAN = re.compile(
-    r'[ąčęėįšųūž]|\b(ir|kad|labai|foje|daina|dainos|albumas|albuma|tai|yra|geras|mamontov\w*|aciu|ačiū|grupe|grupė)\b',
+    r'[ąčęėįšųūž]|\b(ir|kad|labai|foje|daina|dainos|dainu|dainas|albumas|albuma|tai|yra|geras|mamontov\w*|aciu|ačiū'
+    r'|grupe|grupė|muzika|nereal\w*|juos|maciau)\b',
     re.I)
+EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
 # Spam bots found the album comments in 2007; earlier comments without links all come from fans.
 BOT_ERA = '2007'
 
@@ -30,18 +32,31 @@ MISSING_ASSETS = {
 }
 CIRCUIT_ALIASES = {'forums': 'forum'}
 OFFSET_PARAMS = {'paging', 'page'}
+REPO = Path(__file__).resolve().parent.parent
+TABLES = {'discography_albums', 'discography_tracks', 'gallery', 'gallery_categories', 'facts', 'media',
+          'album_comments', 'forum_posts'}
+# Rows the 2011 cleanup truncated. All were read by hand: 2007 bot comments and two pasted Wikipedia
+# articles in the forum. Any other count means the parser lost real rows.
+EXPECTED_BROKEN_ROWS = {'album_comments': 654, 'forum_posts': 2}
+COMMENTS_PER_PAGE = 10
+ARTICLES_PER_PAGE = 5
+PHOTO_COLUMNS = 3
+PHOTOS_PER_PAGE = PHOTO_COLUMNS * 3
+THREADS_PER_PAGE = 30
 
 
 def is_fan_comment(row):
-    text = row['comment']
+    text = EMAIL.sub('', row['comment'])
     return not SPAM_MARKERS.search(text) and (row['date'][:4] < BOT_ERA or bool(LITHUANIAN.search(text)))
 
 
 class Archive:
     def __init__(self, old_root):
         self.www = old_root / DATA / 'www'
-        db = parse_dump(old_root / DUMP)
-        self.raw_counts = {name: len(rows) for name, rows in db.items()}
+        db, skipped = parse_dump(old_root / DUMP, TABLES)
+        self.broken_rows = {table: n for table, n in skipped.items() if n}
+        if self.broken_rows != EXPECTED_BROKEN_ROWS:
+            raise SystemExit(f'unparsed dump rows {self.broken_rows}, expected {EXPECTED_BROKEN_ROWS}')
         self.albums = [a for a in db['discography_albums'] if a['deleted'] == 0]
         self.tracks = [t for t in db['discography_tracks'] if t['deleted'] == 0]
         self.gallery = db['gallery']
@@ -67,6 +82,10 @@ class Archive:
 
 def mysql_date(value):
     return value[:10].replace('-', '.')
+
+
+def next_color(color):
+    return '#6F6F6F' if color == '#999999' else '#999999'
 
 
 def forum_time(stamp, sep):
@@ -95,7 +114,7 @@ def render_disco_browse(a, params):
     albums = [x for x in a.albums if x['photo'] in a.gallery_by_id]
     color = ''
     for album in sorted(albums, key=lambda x: x['year'], reverse=True):
-        color = '#6F6F6F' if color == '#999999' else '#999999'
+        color = next_color(color)
         t.set(album_id=album['id'])
         description = album['description']
         if len(description) > 150:
@@ -129,7 +148,7 @@ def render_disco_tracks(a, params):
     t.parse('album', 'album_block')
     tracks = [x for x in a.tracks if x['album_id'] == record['id']]
     for number, track in enumerate(tracks, 1):
-        color = '#6F6F6F' if color == '#999999' else '#999999'
+        color = next_color(color)
         audio, video = ('' if DEAD_URLS.match(link or '') else (link or '').replace('http://foje.lt/www/', '')
                         for link in (track['audio'], track['video']))
         t.set(track_no=number, track_name=track['name'], track_id=track['id'], text='',
@@ -168,15 +187,15 @@ def render_disco_comments(a, params):
     t.set(album_name=record['name'])
     comments = sorted((c for c in a.comments if c['album'] == record['id']),
                       key=lambda c: (c['date'], c['id']), reverse=True)
-    shown = comments[offset:offset + 10]
+    shown = comments[offset:offset + COMMENTS_PER_PAGE]
     t.set(message_count=len(shown), album_id=record['id'])
     for c in shown:
         d = c['date']
         t.set(album_id=record['id'], post_topic='', post_author=hs(c['nick']), post_author_email=hs(c['email']),
               post_message=nl2br(hs(c['comment'])),
-              post_time=f'{d[0:4]}.{d[5:7]}.{d[8:10]} - {d[11:16]}')
+              post_time=f'{mysql_date(d)} - {d[11:16]}')
         t.parse('post', 'post_block', True)
-    t.set(paging=paging(offset, len(comments), 10, '',
+    t.set(paging=paging(offset, len(comments), COMMENTS_PER_PAGE, '',
                         f"index.php?fuseaction=disco.view_comments&id={record['id']}&paging="))
     return a.layout('lay_main.html', t.render())
 
@@ -196,7 +215,7 @@ def render_articles(a, params, circuit, rows):
     for handle, name in (('img_block', 'img'), ('more_block', 'more_b'), ('all_facts_block', 'all_facts'),
                          ('pages_block', 'pages')):
         t.block(handle, name)
-    for i, row in enumerate(article_rows(a, rows)[offset:offset + 5], 1):
+    for i, row in enumerate(article_rows(a, rows)[offset:offset + ARTICLES_PER_PAGE], 1):
         t.set(bg_color=('#9DAEB8', '#AEB5BA')[i % 2])
         set_article_image(t, a, row)
         if row['image']:
@@ -212,8 +231,8 @@ def render_articles(a, params, circuit, rows):
             t.set(more_b='')
         t.set(name=hs(row['name']), date=mysql_date(row['date']), body=body)
         t.parse('all_facts', 'all_facts_block', True)
-    t.set(paging=paging(offset, len(rows), 5, '', f'index.php?fuseaction={circuit}.browse&sort=&paging='))
-    if len(rows) > 5:
+    t.set(paging=paging(offset, len(rows), ARTICLES_PER_PAGE, '', f'index.php?fuseaction={circuit}.browse&sort=&paging='))
+    if len(rows) > ARTICLES_PER_PAGE:
         t.parse('pages', 'pages_block', True)
     else:
         t.set(pages='')
@@ -252,16 +271,16 @@ def render_gallery_photos(a, params):
     t.block('list_rows_block', 'list_rows_b')
     photos = sorted((g for g in a.gallery if g['deleted'] == 0 and str(g['category_id']) == category),
                     key=lambda g: g['id'], reverse=True)
-    for i, photo in enumerate(photos[offset:offset + 9], 1):
+    for i, photo in enumerate(photos[offset:offset + PHOTOS_PER_PAGE], 1):
         t.set(id=photo['id'], name=photo['name'], width=photo['width'], height=photo['height'],
               comment=hs(photo['comment']))
         t.parse('list_cols_b', 'list_cols_block', True)
-        if i % 3 == 0:
+        if i % PHOTO_COLUMNS == 0:
             t.parse('list_rows_b', 'list_rows_block', True)
             t.set(list_cols_b='')
     t.parse('list_rows_b', 'list_rows_block', True)
-    t.set(paging=paging(offset, len(photos), 9, '', f'index.php?fuseaction=gallery.browseFoto&id={category}&paging=')
-          if len(photos) > 9 else '')
+    t.set(paging=paging(offset, len(photos), PHOTOS_PER_PAGE, '', f'index.php?fuseaction=gallery.browseFoto&id={category}&paging=')
+          if len(photos) > PHOTOS_PER_PAGE else '')
     return a.layout('lay_main.html', t.render())
 
 
@@ -287,7 +306,7 @@ def render_forum(a, params):
                          ('thread_block', 'thread')):
         t.block(handle, name)
     threads = sorted((p for p in a.posts if p['parent_id'] == 0), key=lambda p: p['last_message_time'], reverse=True)
-    for thread in threads[offset:offset + 30]:
+    for thread in threads[offset:offset + THREADS_PER_PAGE]:
         replies = sum(1 for p in a.posts if p['parent_id'] == thread['id'])
         t.set(thread_id=thread['id'], thread_mood=thread['mood'] if 1 <= thread['mood'] <= 14 else 0,
               thread_topic=hs(thread['topic']), thread_author=hs(thread['nick']),
@@ -295,8 +314,8 @@ def render_forum(a, params):
               thread_last_message=forum_time(thread['last_message_time'], '&nbsp;'))
         set_author(t, thread['email'], 'thread')
         t.parse('thread', 'thread_block', True)
-    if len(threads) > 30:
-        t.set(topic_counter=paging(offset, len(threads), 30, '', 'index.php?fuseaction=forum.browse&page='))
+    if len(threads) > THREADS_PER_PAGE:
+        t.set(topic_counter=paging(offset, len(threads), THREADS_PER_PAGE, '', 'index.php?fuseaction=forum.browse&page='))
         t.parse('paging', 'paging_block')
     return a.layout('lay_popup.html', t.render())
 
@@ -306,10 +325,8 @@ def render_thread(a, params):
     if not thread:
         return None
     t = a.template('forum/dsp_thread.html')
-    for handle, name in (('no_mail_block', 'no_mail'), ('mail_block', 'mail'), ('post_block', 'post'),
-                         ('thread_block', 'thread')):
-        if f'BEGIN {handle}' in t.text:
-            t.block(handle, name)
+    for handle, name in (('no_mail_block', 'no_mail'), ('mail_block', 'mail'), ('post_block', 'post')):
+        t.block(handle, name)
     posts = sorted((p for p in a.posts if p['id'] == thread['id'] or p['parent_id'] == thread['id']),
                    key=lambda p: (p['time'], p['id']))
     for number, post in enumerate(posts, 1):
@@ -379,7 +396,7 @@ def finish(page, pages):
     page = re.sub(r'<a\b[^>]*%s[^>]*>(.*?)</a>' % DEAD, r'\1', page, flags=re.S | re.I)
     page = re.sub(r'<area\b[^>]*%s[^>]*>\s*' % DEAD, '', page, flags=re.I)
     if DEAD in page:
-        raise SystemExit(f'unresolved dead link left in page: ...{page[page.index(DEAD) - 200:][:300]}')
+        raise SystemExit(f'unresolved dead link left in page: ...{page[max(0, page.index(DEAD) - 200):][:300]}')
     return re.sub(r'charset=windows-1257', 'charset=utf-8', page, flags=re.I)
 
 
@@ -389,6 +406,15 @@ def prepare(page):
 
 
 ASSET = re.compile(r'(?:www/)?((?:images|video)/[^"\'\s)<>]+\.(?:gif|jpe?g|png|mpg))', re.I)
+
+
+def asset_source(a, asset):
+    if (a.www / asset).is_file():
+        return a.www / asset, 0
+    if asset in MISSING_ASSETS:
+        replacement, thumbnail = MISSING_ASSETS[asset]
+        return REPO / replacement, thumbnail
+    return None
 
 
 def build(old_root, out):
@@ -406,45 +432,41 @@ def build(old_root, out):
         if html_page:
             queue.extend(links(pages[key]))
 
+    finals = {file_name(key): finish(page, pages) for key, page in pages.items() if page}
+    front_page = finish(front, pages)
+    css = (a.www / 'style.css').read_bytes().decode('cp1257')
+    assets = set(ASSET.findall(css + front_page)).union(*(ASSET.findall(page) for page in finals.values()))
+    sources = {asset: asset_source(a, asset) for asset in sorted(assets)}
+    missing = [asset for asset, source in sources.items() if not source]
+    if missing:
+        raise SystemExit(f'missing assets: {missing}')
+
     if out.exists():
         shutil.rmtree(out)
     (out / 'www').mkdir(parents=True)
-    (out / 'index.html').write_text(finish(front, pages), encoding='utf-8')
-    css = (a.www / 'style.css').read_bytes().decode('cp1257')
+    (out / 'index.html').write_text(front_page, encoding='utf-8')
     (out / 'www' / 'style.css').write_text(css, encoding='utf-8')
-    assets = set(ASSET.findall(front)) | set(ASSET.findall(css))
-    for key, page in pages.items():
-        if page:
-            final = finish(page, pages)
-            (out / 'www' / file_name(key)).write_text(final, encoding='utf-8')
-            assets |= set(ASSET.findall(final))
-
-    missing = []
-    for asset in sorted(assets):
-        source, target = a.www / asset, out / 'www' / asset
+    for name, page in finals.items():
+        (out / 'www' / name).write_text(page, encoding='utf-8')
+    for asset, (source, thumbnail) in sources.items():
+        target = out / 'www' / asset
         target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_file():
-            shutil.copy2(source, target)
-        elif asset in MISSING_ASSETS:
-            replacement, thumbnail = MISSING_ASSETS[asset]
-            subprocess.run(['sips', '-Z', str(thumbnail), str(out.parent / replacement), '--out', str(target)]
-                           if thumbnail else ['cp', str(out.parent / replacement), str(target)],
-                           check=True, capture_output=True)
+        if thumbnail:
+            subprocess.run(['sips', '-Z', str(thumbnail), str(source), '--out', str(target)],
+                           check=True, stdout=subprocess.DEVNULL)
         else:
-            missing.append(asset)
+            shutil.copy2(source, target)
 
-    live = sum(1 for p in pages.values() if p)
-    print(f'pages: {live} written, {len(pages) - live} dead links unlinked: '
-          f'{sorted(file_name(k) for k, p in pages.items() if not p)}')
-    print(f'assets: {len(assets) - len(missing)} copied, {len(missing)} missing: {missing}')
+    print(f'pages: {len(finals)} written; unlinked: {sorted(file_name(k) for k, p in pages.items() if not p)}')
+    print(f'assets: {len(sources)} copied')
     print(f'album comments: {len(a.comments)} kept, {a.dropped_comments} dropped as spam')
-    print(f'forum posts: {len(a.posts)} kept; rows parsed per table: {a.raw_counts}')
+    print(f'forum posts: {len(a.posts)} kept; broken rows skipped: {a.broken_rows}')
 
 
 def main():
     parser = argparse.ArgumentParser(description='Rebuild the 2002-2007 foje.lt as static pages under senas/.')
     parser.add_argument('old_root', type=Path, help='path to the FOJE_old_version folder')
-    parser.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'senas')
+    parser.add_argument('--out', type=Path, default=REPO / 'senas')
     args = parser.parse_args()
     build(args.old_root, args.out)
 
