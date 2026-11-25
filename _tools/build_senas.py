@@ -30,6 +30,11 @@ MISSING_ASSETS = {
     'images/gallery/foje_kpp.jpg': ('imgs/FOJE_virselis_kita_paveikslo_puse_cd.jpg', 0),
     'images/gallery/small/foje_kpp.jpg': ('imgs/FOJE_virselis_kita_paveikslo_puse_cd.jpg', 100),
 }
+# The old site's .mpg is really Windows Media (WMV2), which browsers can't play, so the build converts it to
+# H.264 MP4. The bitexact flags and a single thread keep ffmpeg's output identical between rebuilds.
+MP4_OPTIONS = ['-c:v', 'libx264', '-crf', '23', '-preset', 'slow', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k',
+               '-movflags', '+faststart', '-map_metadata', '-1', '-fflags', '+bitexact', '-flags', '+bitexact',
+               '-threads', '1']
 CIRCUIT_ALIASES = {'forums': 'forum'}
 OFFSET_PARAMS = {'paging', 'page'}
 REPO = Path(__file__).resolve().parent.parent
@@ -138,6 +143,8 @@ def render_disco_tracks(a, params):
     if not record:
         return None
     t = a.template('chrestomatija/disco/dsp_tracks.html')
+    # In the 280px content frame a video would be too small to watch, so it opens in its own tab.
+    t.text = t.text.replace('<a href="{video_link}">', '<a href="{video_link}" target="_blank">')
     for handle in ('text', 'audio', 'video', 'no_text', 'no_audio', 'no_video', 'album', 'track'):
         t.block(f'{handle}_block', handle)
     photo = a.gallery_by_id.get(record['photo'], {})
@@ -151,6 +158,7 @@ def render_disco_tracks(a, params):
         color = next_color(color)
         audio, video = ('' if DEAD_URLS.match(link or '') else (link or '').replace('http://foje.lt/www/', '')
                         for link in (track['audio'], track['video']))
+        video = re.sub(r'\.mpg$', '.mp4', video)
         t.set(track_no=number, track_name=track['name'], track_id=track['id'], text='',
               audio_link=audio, video_link=video, color=color)
         for handle, present in (('text', track['text']), ('audio', audio), ('video', video)):
@@ -405,15 +413,19 @@ def prepare(page):
     return re.sub(r'<form\b.*?</form>', '', page, flags=re.S | re.I)
 
 
-ASSET = re.compile(r'(?:www/)?((?:images|video)/[^"\'\s)<>]+\.(?:gif|jpe?g|png|mpg))', re.I)
+ASSET = re.compile(r'(?:www/)?((?:images|video)/[^"\'\s)<>]+\.(?:gif|jpe?g|png|mp4))', re.I)
 
 
-def asset_source(a, asset):
+def asset_plan(a, asset, target):
     if (a.www / asset).is_file():
-        return a.www / asset, 0
+        return a.www / asset, None
     if asset in MISSING_ASSETS:
-        replacement, thumbnail = MISSING_ASSETS[asset]
-        return REPO / replacement, thumbnail
+        replacement, size = MISSING_ASSETS[asset]
+        source = REPO / replacement
+        return source, ['sips', '-Z', str(size), str(source), '--out', str(target)] if size else None
+    mpeg = a.www / Path(asset).with_suffix('.mpg')
+    if asset.endswith('.mp4') and mpeg.is_file():
+        return mpeg, ['ffmpeg', '-loglevel', 'error', '-i', str(mpeg), *MP4_OPTIONS, str(target)]
     return None
 
 
@@ -436,10 +448,13 @@ def build(old_root, out):
     front_page = finish(front, pages)
     css = (a.www / 'style.css').read_bytes().decode('cp1257')
     assets = set(ASSET.findall(css + front_page)).union(*(ASSET.findall(page) for page in finals.values()))
-    sources = {asset: asset_source(a, asset) for asset in sorted(assets)}
-    missing = [asset for asset, source in sources.items() if not source]
+    plans = {asset: asset_plan(a, asset, out / 'www' / asset) for asset in sorted(assets)}
+    missing = [asset for asset, plan in plans.items() if not plan]
     if missing:
         raise SystemExit(f'missing assets: {missing}')
+    absent = sorted({command[0] for _, command in plans.values() if command and not shutil.which(command[0])})
+    if absent:
+        raise SystemExit(f'install {absent} to build the archive')
 
     if out.exists():
         shutil.rmtree(out)
@@ -448,17 +463,16 @@ def build(old_root, out):
     (out / 'www' / 'style.css').write_text(css, encoding='utf-8')
     for name, page in finals.items():
         (out / 'www' / name).write_text(page, encoding='utf-8')
-    for asset, (source, thumbnail) in sources.items():
+    for asset, (source, command) in plans.items():
         target = out / 'www' / asset
         target.parent.mkdir(parents=True, exist_ok=True)
-        if thumbnail:
-            subprocess.run(['sips', '-Z', str(thumbnail), str(source), '--out', str(target)],
-                           check=True, stdout=subprocess.DEVNULL)
+        if command:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
         else:
             shutil.copy2(source, target)
 
     print(f'pages: {len(finals)} written; unlinked: {sorted(file_name(k) for k, p in pages.items() if not p)}')
-    print(f'assets: {len(sources)} copied')
+    print(f'assets: {len(plans)} written')
     print(f'album comments: {len(a.comments)} kept, {a.dropped_comments} dropped as spam')
     print(f'forum posts: {len(a.posts)} kept; broken rows skipped: {a.broken_rows}')
 
